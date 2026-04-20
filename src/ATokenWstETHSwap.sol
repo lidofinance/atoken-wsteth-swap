@@ -141,7 +141,7 @@ contract ATokenWstETHSwap {
     }
 
     /// @notice Premium profit in aEthwstETH for a given aEthWETH input.
-    function getWstETHProfit(uint256 amountIn) public view returns (uint256) {
+    function getWstETHProfit(uint256 amountIn) external view returns (uint256) {
         uint256 rate = wstETH.stEthPerToken();
         uint256 fullAmount = (amountIn * 1e18) / rate;
         return fullAmount - getWstETHAmountOut(amountIn);
@@ -233,7 +233,7 @@ contract ATokenWstETHSwap {
     ///      in production.
     /// @param target_ Address to delegatecall.
     /// @param data_   Calldata to forward.
-    function spell(address target_, bytes memory data_) public onlyOwner returns (bytes memory response_) {
+    function spell(address target_, bytes memory data_) external onlyOwner returns (bytes memory response_) {
         assembly {
             let succeeded := delegatecall(gas(), target_, add(data_, 0x20), mload(data_), 0, 0)
             let size := returndatasize()
