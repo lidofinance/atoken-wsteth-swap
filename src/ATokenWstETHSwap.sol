@@ -5,7 +5,7 @@ import {IERC20} from "./interfaces/IERC20.sol";
 import {IWstETH} from "./interfaces/IWstETH.sol";
 
 /// @title ATokenWstETHSwap
-/// @notice Enables swapping aEthWETH for aEthwstETH at the oracle-derived wstETH rate
+/// @notice Enables swapping aEthWETH for aEthwstETH at the current WstETH.stEthPerToken() rate
 ///         with a configurable premium.
 /// @dev The `vault` pre-approves this contract to spend its aEthwstETH. Users approve
 ///      this contract to spend their aEthWETH, then call swap functions. Premium profit
@@ -13,10 +13,13 @@ import {IWstETH} from "./interfaces/IWstETH.sol";
 ///
 ///      `vault` here refers to the address that holds the leveraged Aave V3 position
 ///      (aEthwstETH collateral + variableDebtEthWETH debt). In a Mellow Core Vaults
-///      deployment this is typically the Subvault address, not the user-facing Vault
-///      contract — verify with `CheckMellowBalances` script before deployment.
+///      deployment this is typically the Subvault address.
+///
+///      Based on Fluid's FluidATokenSwap contract deployed at
+///      0x4f8f03cad7512e4f6d1050fb9b2f8b91ae4bc901.
 contract ATokenWstETHSwap {
     // ─── Constants ───────────────────────────────────────────────────────
+    uint256 public constant MAX_PREMIUM = 1e5; // 1e5 = 10%
     uint256 public constant PREMIUM_PRECISION = 1e6; // 1e6 = 100%
 
     IERC20 public constant aEthWETH = IERC20(0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8);
@@ -39,7 +42,7 @@ contract ATokenWstETHSwap {
     event PremiumUpdated(uint256 oldPremium, uint256 newPremium);
     event Paused(address account);
     event Unpaused(address account);
-    event ReferralRecorded(address indexed user, address indexed referral);
+    event ReferralRecorded(address indexed user, address indexed referral, uint256 aEthWETHIn, uint256 aEthwstETHOut);
 
     // ─── Errors ──────────────────────────────────────────────────────────
     error OnlyOwner();
@@ -72,7 +75,7 @@ contract ATokenWstETHSwap {
         vault = _vault;
         profitReceiver = _profitReceiver;
 
-        if (_premium >= PREMIUM_PRECISION) revert PremiumTooHigh();
+        if (_premium > MAX_PREMIUM) revert PremiumTooHigh();
         premium = _premium;
     }
 
@@ -92,7 +95,7 @@ contract ATokenWstETHSwap {
         returns (uint256 amountOut)
     {
         amountOut = swapToWstETH(amountIn, amountOutMin);
-        emit ReferralRecorded(msg.sender, referral);
+        emit ReferralRecorded(msg.sender, referral, amountIn, amountOut);
     }
 
     /// @notice Swap aEthWETH for aEthwstETH. Premium profit is sent to profitReceiver.
@@ -144,7 +147,7 @@ contract ATokenWstETHSwap {
         return fullAmount - getWstETHAmountOut(amountIn);
     }
 
-    /// @notice Current exchange rate: stETH per 1 wstETH (18 decimals).
+    /// @notice Current wstETH.stEthPerToken() rate (stETH per 1 wstETH, 18 decimals).
     function getWstETHRate() external view returns (uint256) {
         return wstETH.stEthPerToken();
     }
@@ -198,7 +201,7 @@ contract ATokenWstETHSwap {
     /// @notice Update the premium charged on swaps.
     /// @param _premium New premium in 6-decimal format (e.g. 20000 = 2%).
     function setPremium(uint256 _premium) external onlyOwner {
-        if (_premium >= PREMIUM_PRECISION) revert PremiumTooHigh();
+        if (_premium > MAX_PREMIUM) revert PremiumTooHigh();
         emit PremiumUpdated(premium, _premium);
         premium = _premium;
     }
@@ -215,10 +218,21 @@ contract ATokenWstETHSwap {
         emit Unpaused(msg.sender);
     }
 
-    /// @notice Open payload method for owner to resolve emergency cases (e.g. rescue stuck tokens).
-    /// @dev Delegatecalls `target_` with `data_` in this contract's storage context.
-    /// @param target_ Address to which the call needs to be delegated
-    /// @param data_   Data to execute at the delegated address
+    /// @notice Owner-only escape hatch via delegatecall. Emergency use only — not part of
+    ///         normal operation.
+    ///
+    /// @dev Owner has god-mode privileges via this function: can drain the vault's approved
+    ///      allowance, overwrite any storage, bypass every invariant. Owning this contract
+    ///      is equivalent to custody of the vault's approved aEthwstETH allowance.
+    ///
+    ///      Intended strictly for emergency corrective actions (e.g., rescuing mis-sent
+    ///      tokens, recovering from unforeseen state). Must not be used in routine flows;
+    ///      every call should be publicly justified and auditable.
+    ///
+    ///      Choose the owner accordingly: multisig or timelock-gated governance, should never be an EOA
+    ///      in production.
+    /// @param target_ Address to delegatecall.
+    /// @param data_   Calldata to forward.
     function spell(address target_, bytes memory data_) public onlyOwner returns (bytes memory response_) {
         assembly {
             let succeeded := delegatecall(gas(), target_, add(data_, 0x20), mload(data_), 0, 0)

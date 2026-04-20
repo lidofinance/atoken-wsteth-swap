@@ -15,7 +15,7 @@ contract ATokenWstETHSwapIntegrationTest is Test {
 
     // Event redeclarations — needed so `emit ... ` / `vm.expectEmit` can reference them.
     event SwapWstETH(address indexed user, uint256 aEthWETHIn, uint256 aEthwstETHOut, uint256 profit);
-    event ReferralRecorded(address indexed user, address indexed referral);
+    event ReferralRecorded(address indexed user, address indexed referral, uint256 aEthWETHIn, uint256 aEthwstETHOut);
     event PremiumUpdated(uint256 oldPremium, uint256 newPremium);
     event Paused(address account);
     event Unpaused(address account);
@@ -40,6 +40,12 @@ contract ATokenWstETHSwapIntegrationTest is Test {
     ATokenWstETHSwap swap;
 
     function setUp() public {
+        // At block 24921000:
+        //   aEthwstETH.balanceOf(VAULT)          ≈ 135,824.62 wstETH (1.358e23 wei)
+        //   variableDebtEthWETH.balanceOf(VAULT) ≈ 141,684.07 WETH   (1.416e23 wei)
+        //   aEthWETH.balanceOf(VAULT)            = 0
+        // Invariant headroom: debt - supply ≈ 141,684 WETH (drives maxSwapFromDebtCeiling).
+        // The vault holds only wstETH collateral and WETH debt — a pure leveraged stETH loop.
         vm.createSelectFork(vm.rpcUrl("mainnet"), 24921000);
 
         // Direct deploy — no proxy. Premium starts at 0; individual tests set it via setPremium.
@@ -202,9 +208,11 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         vm.prank(user);
         aEthWETH.approve(address(swap), amountIn);
 
-        // Expect the referral event with both topics matching.
-        vm.expectEmit(true, true, false, false, address(swap));
-        emit ReferralRecorded(user, referral);
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        // Expect the referral event with both topics matching and data (amounts) equal.
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit ReferralRecorded(user, referral, amountIn, expectedOut);
 
         vm.prank(user);
         swap.swapToWstETHWithReferral(amountIn, 0, referral);
@@ -272,5 +280,472 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         vm.prank(user);
         vm.expectRevert(ATokenWstETHSwap.OnlyOwner.selector);
         swap.spell(address(0), "");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // DEBT-CEILING INVARIANT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_SwapToWstETH_RevertsOnDebtCeilingBreach() public {
+        // We can't induce a real breach: overshooting the ceiling means draining
+        // enough aEthwstETH from the (leveraged) vault to crash its Aave health
+        // factor, which reverts before `_checkDebtCeiling` is reached.
+        //
+        // Instead, spoof `variableDebtEthWETH.balanceOf(VAULT)` so our contract
+        // sees a low debt value. Aave's HF math uses `scaledBalanceOf` (different
+        // calldata), so the mock doesn't affect its validation.
+        uint256 supply = aEthWETH.balanceOf(VAULT);
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(supply + 1)
+        );
+
+        uint256 amountIn = 1 ether; // HF-safe on this vault (see happy-path test).
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(user);
+        vm.expectPartialRevert(ATokenWstETHSwap.DebtCeilingBreached.selector);
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    function test_SwapToWstETH_BoundaryDebtCeiling() public {
+        // Use mocked debt to straddle the ceiling precisely. Same rationale as
+        // `test_SwapToWstETH_RevertsOnDebtCeilingBreach` above.
+        uint256 supply = aEthWETH.balanceOf(VAULT);
+        uint256 amountIn = 1 ether;
+
+        // Pass side: debt comfortably above post-swap supply → no breach.
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(supply + amountIn + 1 ether)
+        );
+
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0);
+
+        // Revert side: mock debt so that any further supply increase crosses it.
+        uint256 newSupply = aEthWETH.balanceOf(VAULT);
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(newSupply)
+        );
+        uint256 amountIn2 = 100; // tiny; premium=0 so no profit transfer dust issue.
+        _fundUserWithAEthWETH(user, amountIn2);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn2);
+        vm.prank(user);
+        vm.expectPartialRevert(ATokenWstETHSwap.DebtCeilingBreached.selector);
+        swap.swapToWstETH(amountIn2, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // INSUFFICIENT LIQUIDITY — BOTH CODE PATHS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_SwapToWstETH_RevertsOnInsufficientAllowance() public {
+        uint256 amountIn = 1 ether;
+        uint256 rate = swap.getWstETHRate();
+        uint256 fullAmount = (amountIn * 1e18) / rate;
+
+        // Reduce the vault's allowance below fullAmount.
+        uint256 smallAllowance = fullAmount - 1;
+        vm.prank(VAULT);
+        aEthwstETH.approve(address(swap), smallAllowance);
+
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(ATokenWstETHSwap.InsufficientLiquidity.selector, smallAllowance, fullAmount)
+        );
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    function test_SwapToWstETH_RevertsOnInsufficientBalance() public {
+        uint256 amountIn = 1 ether;
+        uint256 rate = swap.getWstETHRate();
+        uint256 fullAmount = (amountIn * 1e18) / rate;
+
+        // Can't use stdstore.find() for VAULT (nonzero initial balance + scaled-index
+        // layout breaks the probe heuristic), and can't `vm.prank(VAULT)` a transfer
+        // out — Aave's HF check blocks it on a leveraged position. Spoof balanceOf
+        // with a mock instead. Allowance is still MAX from setUp.
+        vm.mockCall(
+            address(aEthwstETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(uint256(0))
+        );
+        assertEq(aEthwstETH.balanceOf(VAULT), 0, "mock must stick");
+        assertEq(aEthwstETH.allowance(VAULT, address(swap)), type(uint256).max, "allowance still MAX");
+
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(ATokenWstETHSwap.InsufficientLiquidity.selector, 0, fullAmount));
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SwapWstETH EVENT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_SwapToWstETH_EmitsSwapWstETH_ZeroPremium() public {
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit SwapWstETH(user, amountIn, expectedOut, 0);
+
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    function test_SwapToWstETH_EmitsSwapWstETH_WithPremium() public {
+        uint256 premium = 20_000;
+        vm.prank(owner);
+        swap.setPremium(premium);
+
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+        uint256 expectedProfit = swap.getWstETHProfit(amountIn);
+
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit SwapWstETH(user, amountIn, expectedOut, expectedProfit);
+
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // swapToWstETHWithReferral — extended coverage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_SwapToWstETHWithReferral_EmitsBothEvents() public {
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+        uint256 expectedProfit = swap.getWstETHProfit(amountIn);
+
+        // Events must fire in order: SwapWstETH first (from inner swapToWstETH),
+        // then ReferralRecorded (after the inner call returns).
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit SwapWstETH(user, amountIn, expectedOut, expectedProfit);
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit ReferralRecorded(user, referral, amountIn, expectedOut);
+
+        vm.prank(user);
+        swap.swapToWstETHWithReferral(amountIn, 0, referral);
+    }
+
+    function test_SwapToWstETHWithReferral_ZeroReferralAddress() public {
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit ReferralRecorded(user, address(0), amountIn, expectedOut);
+
+        vm.prank(user);
+        swap.swapToWstETHWithReferral(amountIn, 0, address(0));
+    }
+
+    function test_SwapToWstETHWithReferral_ReturnsCorrectAmount() public {
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        vm.prank(user);
+        uint256 amountOut = swap.swapToWstETHWithReferral(amountIn, 0, referral);
+        assertEq(amountOut, expectedOut);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_GetWstETHRateWithPremium_MatchesFormula() public {
+        uint256 premium = 50_000;
+        vm.prank(owner);
+        swap.setPremium(premium);
+
+        uint256 rate = swap.getWstETHRate();
+        uint256 precision = swap.PREMIUM_PRECISION();
+        uint256 expected = (rate * precision) / (precision - premium);
+        assertEq(swap.getWstETHRateWithPremium(), expected);
+    }
+
+    function test_MaxSwapToWstETH_ClampedByDebtCeiling() public view {
+        // Vault chosen so liquidity (converted to aEthWETH equivalent) exceeds the
+        // debt-ceiling headroom — so max is bounded by the ceiling.
+        uint256 liquidity = swap.availableWstETHLiquidity();
+        uint256 rate = swap.getWstETHRate();
+        uint256 maxByLiquidity = (liquidity * rate) / 1e18;
+        uint256 maxByCeiling = swap.maxSwapFromDebtCeiling();
+        assertLt(maxByCeiling, maxByLiquidity, "vault must be picked so ceiling < liquidity");
+        assertEq(swap.maxSwapToWstETH(), maxByCeiling);
+    }
+
+    function test_MaxSwapToWstETH_ClampedByLiquidity() public {
+        // Lower allowance far below debt-ceiling headroom.
+        uint256 tinyAllowance = 1e6;
+        vm.prank(VAULT);
+        aEthwstETH.approve(address(swap), tinyAllowance);
+
+        uint256 rate = swap.getWstETHRate();
+        uint256 expectedMax = (tinyAllowance * rate) / 1e18;
+        // Sanity: ceiling must be well above this, otherwise test premise is wrong.
+        assertGt(swap.maxSwapFromDebtCeiling(), expectedMax, "ceiling should dominate");
+        assertEq(swap.maxSwapToWstETH(), expectedMax);
+    }
+
+    function test_MaxSwapToWstETH_ZeroWhenNoLiquidity() public {
+        vm.prank(VAULT);
+        aEthwstETH.approve(address(swap), 0);
+        assertEq(swap.maxSwapToWstETH(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PAUSE / UNPAUSE events + round-trip
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_Pause_EmitsPausedEvent() public {
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit Paused(owner);
+
+        vm.prank(owner);
+        swap.pause();
+    }
+
+    function test_Unpause_EmitsUnpausedEvent() public {
+        vm.prank(owner);
+        swap.pause();
+
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit Unpaused(owner);
+
+        vm.prank(owner);
+        swap.unpause();
+    }
+
+    function test_PauseUnpause_RoundTrip() public {
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(owner);
+        swap.pause();
+
+        vm.prank(user);
+        vm.expectRevert(ATokenWstETHSwap.ContractPaused.selector);
+        swap.swapToWstETH(amountIn, 0);
+
+        vm.prank(owner);
+        swap.unpause();
+
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0); // succeeds
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // spell() — delegatecall happy path + revert propagation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_Spell_ExecutesDelegateCall() public {
+        bytes memory data = abi.encodeWithSelector(swap.pause.selector);
+
+        // `pause()` emits `Paused(msg.sender)`. Delegatecall preserves msg.sender from
+        // the calling frame (spell's frame, where msg.sender == owner), so the event
+        // account should be `owner` — NOT address(swap). This proves two things at once:
+        //  • delegatecall ran pause()'s code against this contract's storage (paused flag flips)
+        //  • msg.sender was preserved through the delegatecall frame
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit Paused(owner);
+
+        vm.prank(owner);
+        swap.spell(address(swap), data);
+
+        assertTrue(swap.paused(), "delegatecalled pause() did not flip storage");
+    }
+
+    function test_Spell_PropagatesRevertData() public {
+        uint256 precision = swap.PREMIUM_PRECISION();
+        bytes memory data = abi.encodeWithSelector(ATokenWstETHSwap.setPremium.selector, precision);
+
+        vm.prank(owner);
+        vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
+        swap.spell(address(swap), data);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PREMIUM BOUNDARIES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_SetPremium_AtMaxPremium_Succeeds() public {
+        uint256 maxPremium = swap.MAX_PREMIUM();
+        vm.prank(owner);
+        swap.setPremium(maxPremium);
+        assertEq(swap.premium(), maxPremium);
+    }
+
+    function test_SetPremium_AboveMaxPremium_Reverts() public {
+        uint256 justAbove = swap.MAX_PREMIUM() + 1;
+        vm.prank(owner);
+        vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
+        swap.setPremium(justAbove);
+    }
+
+    function test_Constructor_AcceptsMaxPremium() public {
+        uint256 maxPremium = swap.MAX_PREMIUM();
+        ATokenWstETHSwap fresh = new ATokenWstETHSwap(owner, VAULT, profitReceiver, maxPremium);
+        assertEq(fresh.premium(), maxPremium);
+    }
+
+    function test_Constructor_RevertsAboveMaxPremium() public {
+        uint256 justAbove = swap.MAX_PREMIUM() + 1;
+        vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
+        new ATokenWstETHSwap(owner, VAULT, profitReceiver, justAbove);
+    }
+
+    function test_SwapToWstETH_AtMaxPremium_SplitMatchesFormula() public {
+        uint256 maxPremium = swap.MAX_PREMIUM(); // 10%
+        vm.prank(owner);
+        swap.setPremium(maxPremium);
+
+        uint256 amountIn = 1 ether;
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        uint256 rate = swap.getWstETHRate();
+        uint256 precision = swap.PREMIUM_PRECISION();
+        uint256 expectedOut = (amountIn * (precision - maxPremium) / precision) * 1e18 / rate;
+        uint256 expectedFull = (amountIn * 1e18) / rate;
+        uint256 expectedProfit = expectedFull - expectedOut;
+
+        uint256 profitReceiverBefore = aEthwstETH.balanceOf(profitReceiver);
+        uint256 userBefore = aEthwstETH.balanceOf(user);
+        vm.prank(user);
+        uint256 amountOut = swap.swapToWstETH(amountIn, 0);
+        assertEq(amountOut, expectedOut, "amountOut mismatch at MAX_PREMIUM");
+
+        // User gets 90%, profitReceiver gets 10% (within 1 wei drift on each leg).
+        assertApproxEqAbs(aEthwstETH.balanceOf(user), userBefore + expectedOut, 2, "user leg");
+        assertApproxEqAbs(
+            aEthwstETH.balanceOf(profitReceiver) - profitReceiverBefore,
+            expectedProfit,
+            2,
+            "profit leg"
+        );
+    }
+
+    function test_SetPremium_EmitsOldAndNewCorrectly() public {
+        vm.prank(owner);
+        swap.setPremium(10_000);
+
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit PremiumUpdated(10_000, 30_000);
+
+        vm.prank(owner);
+        swap.setPremium(30_000);
+        assertEq(swap.premium(), 30_000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Premium = 0 ⇒ profit = 0
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_Premium0_ProducesZeroProfit() public view {
+        assertEq(swap.premium(), 0, "setUp leaves premium at 0");
+        uint256[4] memory amounts = [uint256(1e6), uint256(1e12), uint256(1 ether), uint256(100 ether)];
+        for (uint256 i = 0; i < amounts.length; i++) {
+            // If this fails by 1 wei for some input, see AUDIT_SCOPE §5.1 (rounding inconsistency).
+            assertEq(swap.getWstETHProfit(amounts[i]), 0, "profit must be exactly 0 at premium=0");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Allowance depletion flow
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function test_NonMaxAllowance_DepletesAfterSwap() public {
+        uint256 amountIn = 1 ether;
+        uint256 rate = swap.getWstETHRate();
+        uint256 fullAmount = (amountIn * 1e18) / rate;
+
+        // Approve exactly enough for one swap at premium=0 (fullAmount == amountOut).
+        vm.prank(VAULT);
+        aEthwstETH.approve(address(swap), fullAmount);
+
+        _fundUserWithAEthWETH(user, amountIn * 2);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn * 2);
+
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0); // consumes the allowance
+
+        // Second identical swap reverts — allowance fully depleted.
+        vm.prank(user);
+        vm.expectPartialRevert(ATokenWstETHSwap.InsufficientLiquidity.selector);
+        swap.swapToWstETH(amountIn, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Fuzz — preview consistency
+    // ═══════════════════════════════════════════════════════════════════════
+
+    function testFuzz_GetWstETHAmountOut_MatchesActualSwap(uint256 amountIn, uint256 premium) public {
+        // Bound amountIn to a range that clears both real-world constraints:
+        //   • Upper 1 ether — known HF-safe on this vault (happy-path test passes).
+        //   • Lower 1e15 (0.001 ETH) — ensures the premium-profit transfer doesn't
+        //     round to 0 scaled units inside Aave's aToken.transferFrom, which
+        //     reverts tiny transfers. At 0.001 ETH * 1 premium, profit is
+        //     ≈ 8e8 wei balanceOf — well above any ray-div rounding threshold.
+        // This narrower range still exercises the preview-vs-actual equivalence;
+        // the debt-ceiling headroom isn't the binding constraint here.
+        amountIn = bound(amountIn, 1e15, 1 ether);
+        premium = bound(premium, 0, swap.MAX_PREMIUM());
+
+        vm.prank(owner);
+        swap.setPremium(premium);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(user);
+        uint256 amountOut = swap.swapToWstETH(amountIn, 0);
+        assertEq(amountOut, expectedOut);
     }
 }

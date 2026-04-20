@@ -5,6 +5,14 @@ A single-purpose swap contract that enables users to exchange `aEthWETH` for
 premium. The contract acts as a de-leveraging rail for a vault that holds a
 leveraged wstETH-collateral / WETH-debt position on Aave V3 Ethereum.
 
+## Origin
+
+This contract is based on Fluid's `FluidATokenSwap`, deployed at
+[`0x4f8f03cad7512e4f6d1050fb9b2f8b91ae4bc901`](https://etherscan.io/address/0x4f8f03cad7512e4f6d1050fb9b2f8b91ae4bc901).
+The original supported two output aTokens (aEthwstETH and aEthweETH) against
+a Fluid liteVault; this version drops weETH support and adapts the counterparty
+to a Mellow Core Vaults subvault.
+
 ## Motivation
 
 A vault running a looped wstETH strategy on Aave V3 accumulates `aEthwstETH`
