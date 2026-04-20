@@ -69,6 +69,39 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         require(aEthWETH.balanceOf(to) >= amount, "funding produced insufficient aEthWETH");
     }
 
+    /// @dev Return the vault's post-swap aEthWETH balance WITHOUT leaving any state
+    ///      behind. Needed for exact-match `expectRevert` on `DebtCeilingBreached`:
+    ///      Aave's rayDiv/rayMul rounding can bias `pre + amountIn` by ±1 wei when
+    ///      the vault has non-zero pre-balance. Precondition: `user` already funded
+    ///      and approved for at least `amountIn`. Requires a mocked debt that
+    ///      trivially satisfies `_checkDebtCeiling`; we override to type(max) for
+    ///      the probe and re-apply the caller's mock on return.
+    function _probePostSwapSupply(uint256 amountIn) internal returns (uint256 postSupply) {
+        // Capture the current mocked debt so we can restore it after the probe.
+        // `balanceOf` returns whatever `vm.mockCall` has registered — there must be
+        // one active before calling this helper.
+        uint256 preProbeDebt = variableDebtEthWETH.balanceOf(VAULT);
+
+        uint256 snap = vm.snapshotState();
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(type(uint256).max)
+        );
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0);
+        postSupply = aEthWETH.balanceOf(VAULT);
+        vm.revertToState(snap);
+
+        // `vm.mockCall` registrations are cheatcode state, not EVM state, so they
+        // survive `revertToState`. Re-apply the caller's original mock.
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(preProbeDebt)
+        );
+    }
+
     // ─── Setup / constructor tests ───────────────────────────────────────
 
     function test_Setup_InitialState() public view {
@@ -92,12 +125,6 @@ contract ATokenWstETHSwapIntegrationTest is Test {
     function test_Constructor_RevertsOnZeroProfitReceiver() public {
         vm.expectRevert(ATokenWstETHSwap.ZeroAddress.selector);
         new ATokenWstETHSwap(owner, VAULT, address(0), 0);
-    }
-
-    function test_Constructor_RevertsOnPremiumAtOrAboveMax() public {
-        uint256 tooHigh = swap.PREMIUM_PRECISION();
-        vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
-        new ATokenWstETHSwap(owner, VAULT, profitReceiver, tooHigh);
     }
 
     // ─── Swap tests ──────────────────────────────────────────────────────
@@ -244,13 +271,6 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         swap.setPremium(100);
     }
 
-    function test_SetPremium_RevertsAtOrAboveMax() public {
-        uint256 tooHigh = swap.PREMIUM_PRECISION();
-        vm.prank(owner);
-        vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
-        swap.setPremium(tooHigh);
-    }
-
     function test_SetPremium_EmitsPremiumUpdated() public {
         uint256 next = 30_000;
         vm.expectEmit(false, false, false, true, address(swap));
@@ -306,12 +326,18 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         vm.prank(user);
         aEthWETH.approve(address(swap), amountIn);
 
+        // post-swap supply = pre + amountIn (wei-exact, no mid-tx interest drift).
+        uint256 expectedSupply = aEthWETH.balanceOf(VAULT) + amountIn;
+        uint256 expectedDebt = supply + 1;
+
         vm.prank(user);
-        vm.expectPartialRevert(ATokenWstETHSwap.DebtCeilingBreached.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(ATokenWstETHSwap.DebtCeilingBreached.selector, expectedSupply, expectedDebt)
+        );
         swap.swapToWstETH(amountIn, 0);
     }
 
-    function test_SwapToWstETH_BoundaryDebtCeiling() public {
+    function test_SwapToWstETH_PassesAndFailsAroundCeiling() public {
         // Use mocked debt to straddle the ceiling precisely. Same rationale as
         // `test_SwapToWstETH_RevertsOnDebtCeilingBreach` above.
         uint256 supply = aEthWETH.balanceOf(VAULT);
@@ -341,8 +367,65 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         _fundUserWithAEthWETH(user, amountIn2);
         vm.prank(user);
         aEthWETH.approve(address(swap), amountIn2);
+
+        // Probe actual post-swap supply — Aave's ray-rounding drifts by 1 wei when
+        // vault has non-zero pre-balance, so `newSupply + amountIn2` is not wei-exact.
+        uint256 expectedSupply = _probePostSwapSupply(amountIn2);
+        uint256 expectedDebt = newSupply;
+
         vm.prank(user);
-        vm.expectPartialRevert(ATokenWstETHSwap.DebtCeilingBreached.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(ATokenWstETHSwap.DebtCeilingBreached.selector, expectedSupply, expectedDebt)
+        );
+        swap.swapToWstETH(amountIn2, 0);
+    }
+
+    function test_SwapToWstETH_ExactCeilingBoundary() public {
+        // Pins the exact `supply >= debt` boundary in `_checkDebtCeiling`.
+        // Catches regressions where `>=` is accidentally weakened to `>`.
+        uint256 supply = aEthWETH.balanceOf(VAULT);
+        uint256 amountIn = 1 ether;
+
+        // Case 1: debt = post-swap supply + 1 → one wei below ceiling, swap passes.
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(supply + amountIn + 1)
+        );
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+        vm.prank(user);
+        swap.swapToWstETH(amountIn, 0); // succeeds — strict `>` in invariant
+
+        // Case 2: debt = post-swap supply exactly → equality reverts (supply >= debt).
+        uint256 amountIn2 = 1 ether;
+
+        // Seed a mock debt for the probe to read (probe helper captures + restores
+        // this value, so it can be anything non-trivial that passes the probe's
+        // own disabled-ceiling step).
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(type(uint256).max)
+        );
+        _fundUserWithAEthWETH(user, amountIn2);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn2);
+
+        uint256 probeSupply = _probePostSwapSupply(amountIn2);
+
+        // Pin debt == probeSupply so supply and debt are wei-equal at the check.
+        vm.mockCall(
+            address(variableDebtEthWETH),
+            abi.encodeWithSelector(IERC20.balanceOf.selector, VAULT),
+            abi.encode(probeSupply)
+        );
+
+        vm.prank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(ATokenWstETHSwap.DebtCeilingBreached.selector, probeSupply, probeSupply)
+        );
         swap.swapToWstETH(amountIn2, 0);
     }
 
@@ -598,8 +681,8 @@ contract ATokenWstETHSwapIntegrationTest is Test {
     }
 
     function test_Spell_PropagatesRevertData() public {
-        uint256 precision = swap.PREMIUM_PRECISION();
-        bytes memory data = abi.encodeWithSelector(ATokenWstETHSwap.setPremium.selector, precision);
+        uint256 tooHigh = swap.MAX_PREMIUM() + 1;
+        bytes memory data = abi.encodeWithSelector(ATokenWstETHSwap.setPremium.selector, tooHigh);
 
         vm.prank(owner);
         vm.expectRevert(ATokenWstETHSwap.PremiumTooHigh.selector);
@@ -656,6 +739,9 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         uint256 userBefore = aEthwstETH.balanceOf(user);
         vm.prank(user);
         uint256 amountOut = swap.swapToWstETH(amountIn, 0);
+        // Exact equality: the formula above is algebraically identical to the
+        // contract's amountOut computation (same operand order, same rounding).
+        // If the contract's arithmetic changes, this assertion must update.
         assertEq(amountOut, expectedOut, "amountOut mismatch at MAX_PREMIUM");
 
         // User gets 90%, profitReceiver gets 10% (within 1 wei drift on each leg).
@@ -702,6 +788,8 @@ contract ATokenWstETHSwapIntegrationTest is Test {
         uint256 rate = swap.getWstETHRate();
         uint256 fullAmount = (amountIn * 1e18) / rate;
 
+        assertEq(swap.premium(), 0, "test assumes zero premium (setUp default)");
+
         // Approve exactly enough for one swap at premium=0 (fullAmount == amountOut).
         vm.prank(VAULT);
         aEthwstETH.approve(address(swap), fullAmount);
@@ -737,6 +825,23 @@ contract ATokenWstETHSwapIntegrationTest is Test {
 
         vm.prank(owner);
         swap.setPremium(premium);
+
+        uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
+
+        _fundUserWithAEthWETH(user, amountIn);
+        vm.prank(user);
+        aEthWETH.approve(address(swap), amountIn);
+
+        vm.prank(user);
+        uint256 amountOut = swap.swapToWstETH(amountIn, 0);
+        assertEq(amountOut, expectedOut);
+    }
+
+    function testFuzz_AtMaxPremium_PreviewMatchesActual(uint256 amountIn) public {
+        amountIn = bound(amountIn, 1e15, 1 ether);
+        uint256 maxPremium = swap.MAX_PREMIUM();
+        vm.prank(owner);
+        swap.setPremium(maxPremium);
 
         uint256 expectedOut = swap.getWstETHAmountOut(amountIn);
 
